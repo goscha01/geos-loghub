@@ -1,264 +1,237 @@
 # GeosLogHub
-logs gathering  for geos apps
-ASK — Build “LogHub” Central Log Ingest Service (Railway → Grafana Cloud)
-Goal
 
-Create a small NestJS service (“loghub”) that:
+Central Log Ingest Service — Railway → Grafana Cloud
 
-exposes simple HTTP endpoints to receive logs/events from multiple sources
+A lightweight NestJS (Fastify) service that accepts logs/events from any source, normalises them into a consistent OTLP schema, and forwards them to Grafana Cloud. One endpoint for your entire stack.
 
-normalizes them into a consistent schema (labels/attributes)
+---
 
-forwards them to Grafana Cloud OTLP Logs (/otlp/v1/logs)
+## Architecture
 
-returns an ACK quickly (fast, reliable, safe)
+```
+Client apps (Twilio / Vercel / Railway / Chrome / Supabase / custom)
+        │  POST /ingest/log|twilio|vercel
+        │  x-loghub-source + x-loghub-key
+        ▼
+  ┌─────────────┐   normalise + sanitize PII   ┌──────────────────────┐
+  │  LogHub API │ ─────────────────────────►  │  Grafana Cloud OTLP  │
+  │  (Railway)  │                              │  /otlp/v1/logs       │
+  └─────────────┘                              └──────────────────────┘
+```
 
-Why
+---
 
-This gives you one central place where your AI agent can query logs later and every app can dump logs/events without custom Grafana integration.
+## Environment Variables
 
-Requirements
-Tech
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `GRAFANA_OTLP_LOGS_URL` | ✅ | — | Grafana Cloud OTLP endpoint |
+| `GRAFANA_OTLP_AUTH` | ✅ | — | `Basic <base64(instanceId:apiKey)>` |
+| `API_KEYS_JSON` | ✅ | — | JSON map of `source → ingest key` |
+| `DEFAULT_ENV` | — | `prod` | Fallback `env` label |
+| `MAX_BODY_KB` | — | `256` | Max request body size in KB |
+| `ALLOW_PII` | — | `false` | Set `true` to disable PII masking |
+| `PORT` | — | `3000` | HTTP port (Railway sets this automatically) |
 
-NestJS (Fastify or Express ok)
+### Generating `GRAFANA_OTLP_AUTH`
 
-Node 20+
+```bash
+# instanceId = your Grafana Cloud stack numeric ID
+# apiKey    = a Grafana Cloud API token with logs:write scope
+echo -n "instanceId:apiKey" | base64
+# → paste result after "Basic " in GRAFANA_OTLP_AUTH
+```
 
-Deployed on Railway
+### Example `API_KEYS_JSON`
 
-No database required for MVP (optional in Phase 2)
-
-Uses fetch (native Node 18+)
-
-Environment variables (Railway)
-
-GRAFANA_OTLP_LOGS_URL = https://otlp-gateway-prod-us-east-2.grafana.net/otlp/v1/logs
-
-GRAFANA_OTLP_AUTH = Basic <base64(instanceId:token)>
-
-DEFAULT_ENV = prod (or dev)
-
-API_KEYS_JSON = JSON map of source keys (see below)
-
-MAX_BODY_KB = 256 (default)
-
-ALLOW_PII = false (default)
-
-Example API_KEYS_JSON:
-
+```json
 {
-  "twilio": "TWILIO_INGEST_KEY_123",
-  "vercel": "VERCEL_INGEST_KEY_123",
-  "chrome": "CHROME_INGEST_KEY_123",
-  "railway": "RAILWAY_INGEST_KEY_123",
+  "twilio":   "TWILIO_INGEST_KEY_123",
+  "vercel":   "VERCEL_INGEST_KEY_123",
+  "chrome":   "CHROME_INGEST_KEY_123",
+  "railway":  "RAILWAY_INGEST_KEY_123",
   "supabase": "SUPABASE_INGEST_KEY_123"
 }
+```
 
-Auth mechanism:
+---
 
-Clients send header: x-loghub-key: <key>
+## Local Development
 
-Service validates key against API_KEYS_JSON[source]
+```bash
+# 1. Install dependencies
+npm install
 
-Endpoints (MVP)
-1) Health
+# 2. Copy and fill in env vars
+cp .env.example .env
 
-GET /health → { ok: true }
+# 3. Start in watch mode
+npm run start:dev
+```
 
-2) Generic log ingest (most apps should use this)
+---
 
-POST /ingest/log
-Headers:
+## Endpoints
 
-x-loghub-source = railway|vercel|twilio|chrome|supabase|custom
+### `GET /health`
 
-x-loghub-key = source key
-Body (JSON):
+```bash
+curl http://localhost:3000/health
+# → { "ok": true }
+```
 
+---
+
+### `POST /ingest/log` — Generic log ingest
+
+**Headers**
+
+| Header | Value |
+|---|---|
+| `x-loghub-source` | `railway` \| `vercel` \| `twilio` \| `chrome` \| `supabase` \| `custom` |
+| `x-loghub-key` | Matching key from `API_KEYS_JSON` |
+| `Content-Type` | `application/json` |
+
+**Body**
+
+```json
 {
   "service": "leadbridge-api",
-  "app": "leadbridge",
-  "env": "prod",
-  "level": "info",
+  "app":     "leadbridge",
+  "env":     "prod",
+  "level":   "info",
   "message": "something happened",
   "attrs": {
     "request_id": "req_123",
-    "lead_id": "L_456",
-    "callSid": "CA_789"
+    "lead_id":    "L_456",
+    "callSid":    "CA_789"
   }
 }
-3) Twilio event ingest (normalized wrapper)
+```
 
-POST /ingest/twilio
-Headers: same
-Body: raw Twilio webhook/event payload (JSON)
-Service should:
+**Example**
 
-extract correlation fields if present (callSid, messageSid, accountSid)
-
-include source=twilio and service=twilio-webhook
-
-log a concise message like "Twilio event received" plus normalized attributes
-
-4) Vercel drain ingest (optional MVP)
-
-POST /ingest/vercel
-Headers: same
-Body: accept arbitrary JSON (don’t assume format), store as message.
-
-(If drains are tricky, keep this endpoint but treat payload as opaque JSON for now.)
-
-Normalization Rules
-Required OTEL resource attributes
-
-service.name = body.service (fallback loghub)
-
-app = body.app (fallback unknown)
-
-env = body.env (fallback DEFAULT_ENV)
-
-source = header x-loghub-source
-
-level = body.level
-
-ts = server received timestamp ISO
-
-Optional attributes (if present)
-
-request_id, lead_id, callSid, messageSid, user_id, phone_hash
-
-Message body
-
-if message is object → JSON stringify
-
-if huge → truncate to 8KB and add attr truncated=true
-
-PII handling (MVP)
-
-By default (ALLOW_PII=false), sanitize:
-
-phone numbers → hash or mask (last 2 digits)
-
-emails → mask
-
-Add pii_sanitized=true attribute when sanitization occurs
-
-If ALLOW_PII=true, do not sanitize
-
-OTLP Forwarder Implementation
-
-Implement a provider GrafanaOtlpForwarder that builds this OTLP payload:
-
-{
-  "resourceLogs": [{
-    "resource": { "attributes": [ ... ] },
-    "scopeLogs": [{
-      "logRecords": [{
-        "timeUnixNano": "<now ns>",
-        "severityText": "INFO|ERROR|WARN|DEBUG",
-        "body": { "stringValue": "<message>" }
-      }]
-    }]
-  }]
-}
-
-Send to GRAFANA_OTLP_LOGS_URL with header:
-
-Authorization: ${GRAFANA_OTLP_AUTH}
-
-Content-Type: application/json
-
-Failure behavior:
-
-Never throw to client unless auth fails
-
-If Grafana push fails: return 202 Accepted and log locally (console) with reason
-
-Add simple in-memory rate limit per source (basic token bucket) to protect the service
-
-Security & Reliability
-Body limits
-
-enforce MAX_BODY_KB (default 256KB)
-
-reject bigger payloads with 413 Payload Too Large
-
-Auth
-
-require x-loghub-source and x-loghub-key for all /ingest/*
-
-return 401 if missing or invalid
-
-Response
-
-200 { ok: true, id: "<uuid>", forwarded: true } if Grafana push succeeded
-
-202 { ok: true, id: "<uuid>", forwarded: false } if push failed (but accepted)
-
-Include an id (UUID) in response and in forwarded log attrs as ingest_id.
-
-Project Structure
-
-src/main.ts (fastify recommended)
-
-src/app.module.ts
-
-src/ingest/ingest.controller.ts
-
-src/ingest/ingest.service.ts (normalize + call forwarder)
-
-src/otel/grafana-otlp.forwarder.ts
-
-src/common/auth.guard.ts
-
-src/common/pii-sanitize.ts
-
-src/common/size-limit.middleware.ts
-
-src/common/rate-limit.ts
-
-Add basic unit tests for:
-
-auth guard
-
-sanitization
-
-payload truncation
-
-OTLP payload builder
-
-Deliverables
-
-A working NestJS app that runs locally (npm run start:dev)
-
-Railway-ready (port from process.env.PORT)
-
-Example curl commands for each endpoint
-
-README with:
-
-env vars
-
-how to generate GRAFANA_OTLP_AUTH
-
-example queries in Grafana Explore:
-
-service.name="loghub"
-
-source="twilio"
-
-callSid="CA..."
-
-Example curls (must be included in README)
-Generic
+```bash
 curl -X POST "$LOGHUB_URL/ingest/log" \
   -H "Content-Type: application/json" \
   -H "x-loghub-source: railway" \
-  -H "x-loghub-key: RAIlWAY_INGEST_KEY_123" \
+  -H "x-loghub-key: RAILWAY_INGEST_KEY_123" \
   -d '{"service":"leadbridge-api","app":"leadbridge","env":"prod","level":"info","message":"hello","attrs":{"request_id":"req_1"}}'
-Twilio
+```
+
+---
+
+### `POST /ingest/twilio` — Twilio webhook ingest
+
+Send any raw Twilio webhook payload; the service extracts `CallSid`, `MessageSid`, `AccountSid`, `CallStatus`, `Direction` automatically.
+
+```bash
 curl -X POST "$LOGHUB_URL/ingest/twilio" \
   -H "Content-Type: application/json" \
   -H "x-loghub-source: twilio" \
   -H "x-loghub-key: TWILIO_INGEST_KEY_123" \
   -d '{"CallSid":"CA123","From":"+18135551212","To":"+18135559876","CallStatus":"no-answer"}'
+```
+
+---
+
+### `POST /ingest/vercel` — Vercel log drain ingest
+
+Accepts arbitrary JSON from Vercel's log drain. The full body is stored as the log message.
+
+```bash
+curl -X POST "$LOGHUB_URL/ingest/vercel" \
+  -H "Content-Type: application/json" \
+  -H "x-loghub-source: vercel" \
+  -H "x-loghub-key: VERCEL_INGEST_KEY_123" \
+  -d '{"level":"error","message":"Function timeout","deploymentId":"dpl_xyz"}'
+```
+
+---
+
+## Response Codes
+
+| Code | Meaning |
+|---|---|
+| `200 { ok, id, forwarded: true }` | Log accepted and forwarded to Grafana successfully |
+| `202 { ok, id, forwarded: false }` | Log accepted but Grafana push failed (logged locally) |
+| `401` | Missing or invalid `x-loghub-source` / `x-loghub-key` |
+| `413` | Body exceeds `MAX_BODY_KB` limit |
+| `429` | Rate limit exceeded for this source |
+
+Every response includes a UUID `id` that is also stored as `ingest_id` in the forwarded log attributes.
+
+---
+
+## Normalization
+
+All ingested logs are mapped to these OTLP resource attributes:
+
+| Attribute | Source |
+|---|---|
+| `service.name` | `body.service` (fallback: `loghub`) |
+| `app` | `body.app` (fallback: `unknown`) |
+| `env` | `body.env` (fallback: `DEFAULT_ENV`) |
+| `source` | `x-loghub-source` header |
+| `level` | `body.level` (fallback: `info`) |
+| `ts` | Server receive time (ISO 8601) |
+| `ingest_id` | Auto-generated UUID |
+
+Optional attributes forwarded when present: `request_id`, `lead_id`, `callSid`, `messageSid`, `user_id`, `phone_hash`.
+
+---
+
+## PII Sanitization
+
+When `ALLOW_PII=false` (default):
+
+- **Phone numbers** → masked to last 2 digits, e.g. `+1-813-555-1212` → `***12`
+- **Emails** → local part masked, e.g. `john@example.com` → `j***@example.com`
+- Attribute `pii_sanitized=true` is added when masking occurs
+
+Set `ALLOW_PII=true` to disable all sanitization.
+
+---
+
+## Grafana Explore Queries
+
+After logs are flowing, use these queries in **Grafana → Explore → Loki**:
+
+```logql
+# All logs from LogHub
+{service_name="loghub"}
+
+# Logs from a specific source
+{source="twilio"}
+
+# Logs from a specific service
+{service_name="leadbridge-api"}
+
+# Find a specific Twilio call
+{source="twilio"} | json | callSid="CA123..."
+
+# Errors only
+{env="prod"} | json | level="error"
+```
+
+---
+
+## Deploying to Railway
+
+1. Push this repo to GitHub
+2. Create a new Railway project → **Deploy from GitHub repo**
+3. Set all required environment variables in Railway's dashboard (Variables tab)
+4. Railway auto-detects the `Dockerfile` and the `railway.toml` health check
+
+The service listens on `process.env.PORT` which Railway injects automatically.
+
+---
+
+## Running Tests
+
+```bash
+npm test
+npm run test:cov
+```
+
+Tests cover: auth guard, PII sanitisation, payload truncation, OTLP payload builder.
