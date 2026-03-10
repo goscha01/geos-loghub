@@ -9,8 +9,9 @@ import {
 export class AuthGuard implements CanActivate {
   canActivate(context: ExecutionContext): boolean {
     const request = context.switchToHttp().getRequest();
-    const source: string = request.headers['x-loghub-source'];
-    const key: string = request.headers['x-loghub-key'];
+    // Accept auth via headers (primary) or query params (for services like Twilio that can't set headers)
+    const source: string = request.headers['x-loghub-source'] ?? request.query['source'];
+    const key: string = request.headers['x-loghub-key'] ?? request.query['key'];
 
     if (!source || !key) {
       throw new UnauthorizedException(

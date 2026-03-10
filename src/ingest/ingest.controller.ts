@@ -6,6 +6,7 @@ import {
   Body,
   UseGuards,
   Res,
+  Req,
 } from '@nestjs/common';
 import { FastifyReply } from 'fastify';
 import { IngestService } from './ingest.service';
@@ -35,10 +36,12 @@ export class IngestController {
   @Post('ingest/twilio')
   @UseGuards(AuthGuard)
   async ingestTwilio(
-    @Headers('x-loghub-source') source: string,
+    @Headers('x-loghub-source') sourceHeader: string,
     @Body() body: any,
     @Res({ passthrough: true }) res: FastifyReply,
+    @Req() req: any,
   ) {
+    const source = sourceHeader ?? req.query['source'] ?? 'twilio';
     const result = await this.ingestService.ingestTwilio(source, body);
     res.code(result.forwarded ? 200 : 202);
     return result;
